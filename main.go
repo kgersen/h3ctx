@@ -36,6 +36,8 @@ import (
 // usage: run with no argument to do a test with 10G of data
 // use the "-s" option to be in server only mode and use another program like curl (or https://nspeed.app) to test
 // locally or over the wire
+// use ther "-t duration" to limit the test duration. for instance '-t 1s' for 1 second.
+// see "-h" also.
 
 // build a 1MiB buffer of random data
 const MaxChunkSize = 1024 * 1024 // warning : 1 MiB // this will be allocated in memory
