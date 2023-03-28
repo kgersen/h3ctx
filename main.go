@@ -257,7 +257,7 @@ func Download(ctx context.Context, url string, h3 bool) error {
 		InsecureSkipVerify: true,
 	}
 	var dialer = &net.Dialer{
-		Timeout:       5 * time.Second, // fail quick
+		Timeout:       1 * time.Second, // fail quick
 		FallbackDelay: -1,              // don't use Happy Eyeballs
 	}
 	var netTransport = http.DefaultTransport.(*http.Transport).Clone()
@@ -372,7 +372,7 @@ func main() {
 		//create a server
 		go createServer(ctx, "", 2222, &wg, ready)
 		<-ready
-		fmt.Printf("server created and listening at %s (tcp/h2) and %s (quic/h3\n", "2222", "2222")
+		fmt.Printf("server created and listening at %s (tcp/h2) and %s (quic/h3)\n", "2222", "2222")
 
 		// if server mode, just wait forever for something else to cancel
 		if *optServer {
