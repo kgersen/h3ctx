@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	crand "crypto/rand"
 	"crypto/rsa"
@@ -52,11 +53,15 @@ func InitBigChunk(seed int64) {
 	}
 }
 
-var tlsConfig *tls.Config
+var serverTlsConfig, clientTlsConfig *tls.Config
 
 func init() {
 	InitBigChunk(time.Now().Unix())
-	tlsConfig = generateTLSConfig()
+	var err error
+	serverTlsConfig, clientTlsConfig, err = generateTLSConfig()
+	if err != nil {
+		panic(err)
+	}
 }
 
 // implements io.Discard
@@ -198,12 +203,12 @@ func createServer(ctx context.Context, host string, port int, wg *sync.WaitGroup
 	server := &http.Server{
 		Addr:      listenAddr,
 		Handler:   createHandler(),
-		TLSConfig: tlsConfig,
+		TLSConfig: serverTlsConfig,
 	}
 	quicConf := &quic.Config{}
 	quicServer := &http3.Server{
 		Addr:       listenAddr,
-		TLSConfig:  tlsConfig,
+		TLSConfig:  serverTlsConfig,
 		QuicConfig: quicConf,
 		Handler:    server.Handler,
 	}
@@ -255,9 +260,7 @@ func createServer(ctx context.Context, host string, port int, wg *sync.WaitGroup
 // http client, download the url to 'null' (discard)
 func Download(ctx context.Context, url string, h3 bool) error {
 
-	tlsClientConfig := &tls.Config{
-		InsecureSkipVerify: true,
-	}
+	tlsClientConfig := clientTlsConfig
 	var dialer = &net.Dialer{
 		Timeout:       1 * time.Second, // fail quick
 		FallbackDelay: -1,              // don't use Happy Eyeballs
@@ -437,37 +440,108 @@ func byteCount(b int64, unit int64, units string) (string, string) {
 	return fmt.Sprintf("%.1f", float64(b)/float64(div)), units[exp : exp+1]
 }
 
-// Setup a bare-bones TLS config for the server (from quic-go/examples)
-func generateTLSConfig() *tls.Config {
-	key, err := rsa.GenerateKey(crand.Reader, 1024)
-	if err != nil {
-		panic(err)
-	}
-	now := time.Now()
-	template := x509.Certificate{
-		SerialNumber: big.NewInt(1),
+// https://gist.github.com/shaneutt/5e1995295cff6721c89a71d13a71c251
+func generateTLSConfig() (serverTLSConf *tls.Config, clientTLSConf *tls.Config, err error) {
+	// set up our CA certificate
+	ca := &x509.Certificate{
+		SerialNumber: big.NewInt(2019),
 		Subject: pkix.Name{
-			CommonName: "localhost",
+			Organization:  []string{"Company, INC."},
+			Country:       []string{"US"},
+			Province:      []string{""},
+			Locality:      []string{"San Francisco"},
+			StreetAddress: []string{"Golden Gate Bridge"},
+			PostalCode:    []string{"94016"},
 		},
-		IsCA:        true,
-		NotBefore:   now,
-		NotAfter:    now.AddDate(0, 0, 1), // Valid for one day
-		ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth, x509.ExtKeyUsageServerAuth},
-
+		NotBefore:             time.Now(),
+		NotAfter:              time.Now().AddDate(10, 0, 0),
+		IsCA:                  true,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth, x509.ExtKeyUsageServerAuth},
+		KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageCertSign,
 		BasicConstraintsValid: true,
 	}
-	certDER, err := x509.CreateCertificate(crand.Reader, &template, &template, &key.PublicKey, key)
-	if err != nil {
-		panic(err)
-	}
-	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(key)})
-	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certDER})
 
-	tlsCert, err := tls.X509KeyPair(certPEM, keyPEM)
+	// create our private and public key
+	caPrivKey, err := rsa.GenerateKey(crand.Reader, 1024)
 	if err != nil {
-		panic(err)
+		return nil, nil, err
 	}
-	return &tls.Config{
-		Certificates: []tls.Certificate{tlsCert},
+
+	// create the CA
+	caBytes, err := x509.CreateCertificate(crand.Reader, ca, ca, &caPrivKey.PublicKey, caPrivKey)
+	if err != nil {
+		return nil, nil, err
 	}
+
+	// pem encode
+	caPEM := new(bytes.Buffer)
+	pem.Encode(caPEM, &pem.Block{
+		Type:  "CERTIFICATE",
+		Bytes: caBytes,
+	})
+
+	caPrivKeyPEM := new(bytes.Buffer)
+	pem.Encode(caPrivKeyPEM, &pem.Block{
+		Type:  "RSA PRIVATE KEY",
+		Bytes: x509.MarshalPKCS1PrivateKey(caPrivKey),
+	})
+
+	// set up our server certificate
+	cert := &x509.Certificate{
+		SerialNumber: big.NewInt(2019),
+		Subject: pkix.Name{
+			Organization:  []string{"Company, INC."},
+			Country:       []string{"US"},
+			Province:      []string{""},
+			Locality:      []string{"San Francisco"},
+			StreetAddress: []string{"Golden Gate Bridge"},
+			PostalCode:    []string{"94016"},
+		},
+		IPAddresses:  []net.IP{net.IPv4(127, 0, 0, 1), net.IPv6loopback},
+		DNSNames:     []string{"localhost"},
+		NotBefore:    time.Now(),
+		NotAfter:     time.Now().AddDate(10, 0, 0),
+		SubjectKeyId: []byte{1, 2, 3, 4, 6},
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth, x509.ExtKeyUsageServerAuth},
+		KeyUsage:     x509.KeyUsageDigitalSignature,
+	}
+
+	certPrivKey, err := rsa.GenerateKey(crand.Reader, 1024)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	certBytes, err := x509.CreateCertificate(crand.Reader, cert, ca, &certPrivKey.PublicKey, caPrivKey)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	certPEM := new(bytes.Buffer)
+	pem.Encode(certPEM, &pem.Block{
+		Type:  "CERTIFICATE",
+		Bytes: certBytes,
+	})
+
+	certPrivKeyPEM := new(bytes.Buffer)
+	pem.Encode(certPrivKeyPEM, &pem.Block{
+		Type:  "RSA PRIVATE KEY",
+		Bytes: x509.MarshalPKCS1PrivateKey(certPrivKey),
+	})
+
+	serverCert, err := tls.X509KeyPair(certPEM.Bytes(), certPrivKeyPEM.Bytes())
+	if err != nil {
+		return nil, nil, err
+	}
+
+	serverTLSConf = &tls.Config{
+		Certificates: []tls.Certificate{serverCert},
+	}
+
+	certpool := x509.NewCertPool()
+	certpool.AppendCertsFromPEM(caPEM.Bytes())
+	clientTLSConf = &tls.Config{
+		RootCAs: certpool,
+	}
+
+	return
 }
