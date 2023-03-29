@@ -31,6 +31,7 @@ import (
 
 	"github.com/quic-go/quic-go"
 	"github.com/quic-go/quic-go/http3"
+	"golang.org/x/net/http2"
 )
 
 // this program compares transfert speed of the Golang http server (and client) between HTTP/2 and HTTP/3 versions
@@ -117,6 +118,17 @@ func rootHandler(w http.ResponseWriter, r *http.Request) {
 	if method == "" {
 		method = "GET"
 	}
+
+	var timeout time.Duration = 0
+	var err error
+	// parse an optionnal "timeout" query parameter in Go time.Duration syntax
+	if sTimeout := r.URL.Query().Get("timeout"); sTimeout != "" {
+		timeout, err = time.ParseDuration(sTimeout)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+		}
+	}
+
 	if method == "GET" {
 		match := StreamPathRegexp.FindStringSubmatch(r.URL.Path[1:])
 		if len(match) == 2 {
@@ -125,7 +137,7 @@ func rootHandler(w http.ResponseWriter, r *http.Request) {
 				http.Error(w, err.Error(), http.StatusBadRequest)
 				return
 			}
-			streamBytes(w, r, n)
+			streamBytes(w, r, n, timeout)
 			return
 		} else {
 			http.Error(w, "Not found (no regexp match)", http.StatusNotFound)
@@ -156,7 +168,7 @@ func rootHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 // send 'size' bytes of random data
-func streamBytes(w http.ResponseWriter, r *http.Request, size int64) {
+func streamBytes(w http.ResponseWriter, r *http.Request, size int64, timeout time.Duration) {
 
 	// the buffer we use to send data
 	var chunkSize int64 = 256 * 1024 // 256KiB chunk (sweet spot value may depend on OS & hardware)
@@ -168,6 +180,14 @@ func streamBytes(w http.ResponseWriter, r *http.Request, size int64) {
 	w.Header().Set("Content-Type", "application/octet-stream")
 	w.Header().Set("Content-Length", strconv.FormatInt(size, 10))
 	//fmt.Printf("header sent to %s: %s\n", r.RemoteAddr, r.URL)
+
+	if timeout > 0 {
+		rc := http.NewResponseController(w)
+		err := rc.SetWriteDeadline(time.Now().Add(timeout))
+		if err != nil {
+			fmt.Printf("can't SetWriteDeadline: %s\n", err)
+		}
+	}
 
 	startTime := time.Now()
 
@@ -312,15 +332,81 @@ func Download(ctx context.Context, url string, h3 bool) error {
 	return err
 }
 
+// try to unify differences between http/1, http/2, http/3 behaviors
+// when a client or server timeout occured
 func fixH2H3Errors(err error) error {
 	if err != nil {
 		fmt.Println("client got error of type", reflect.TypeOf(err))
 	}
+
+	/*
+		from nspeed tests:
+		   net/http errors returned in case of timeouts:
+		   method:
+		      client.Do (c->s) then io.Read response body (s->c)
+		      we catch the err after the .Do and the one after .Read
+		      c->s : we set a timer so the timeout happen during the .Do
+		      s->c : we set a timer so the timeout happen during the .Read
+
+		   client side timeouts:
+		   caused by a http.Request with a context deadline
+
+		   http/1.1:
+		   	c->s: context deadline exceeded type: *url.Error
+		   	s->c: context deadline exceeded type: context.deadlineExceededError
+		   http/1.1 + tls:
+		   	c->s: context deadline exceeded type: *url.Error
+		   	s->c: context deadline exceeded type: context.deadlineExceededError
+		   http/2:
+		   	c->s: context deadline exceeded type: *url.Error
+		   	s->c: context deadline exceeded type: context.deadlineExceededError
+		   http/3:
+		   	c->s: stream 0 canceled by local with error code 268 *url.Error
+		   	s->c: stream 0 canceled by local with error code 268 *quic.StreamError
+
+		   server side timeouts:
+		   caused by a http.Server.WriteTimeout or ReadTimeout/ReadHeaderTimeout
+		   or
+		   http.NewResponseController.SetWriteDeadline/SetReadDeadline
+
+		   http/1.1:
+		     c->s: no error ! (must check how many of the Body was sent to detect the timeout)
+		     s->c: io.ErrUnexpectedEOF
+		   http/1.1 + tls:
+		     c->s: "write: connection reset by peer"  type: *url.Error
+		     s->c: "tls: bad record MAC" type: *tls.permanentError
+		   http/2:
+		     c->s: "stream error: stream ID 1; INTERNAL_ERROR; received from peer" type: *url.Error
+		     s->c: "stream ID 1; INTERNAL_ERROR; received from peer" type: http2.StreamError
+		   http/3:
+		     WriteTimeout & ReadTimeout/ReadHeaderTimeout not handled
+		     SetWriteDeadline/SetReadDeadline not supported
+
+	*/
+
+	// http/3 client : context.DeadlineExceeded returns a quic.StreamError with ErrorCode == 0x10c
 	var qerr *quic.StreamError
 	if errors.As(err, &qerr) && qerr.ErrorCode == 0x10c {
 		// change error to context timeout
 		return context.DeadlineExceeded
 	}
+
+	// http/2 server timeout return: "stream error: stream ID x; INTERNAL_ERROR; received from peer"
+	if h2err, ok := err.(http2.StreamError); ok {
+		// don't change if not remote
+		if h2err.Cause == nil || (h2err.Cause == nil && h2err.Cause.Error() != "received from peer") {
+			return err
+		}
+		if h2err.Code == http2.ErrCodeInternal {
+			fmt.Println("h2 stream error changed to ECONNRESET")
+			return syscall.ECONNRESET
+		}
+		if h2err.Code == http2.ErrCodeStreamClosed {
+			fmt.Println("h2 stream error changed to ErrUnexpectedEOF")
+			return io.ErrUnexpectedEOF // we micmic http/1.1
+		}
+	}
+
 	return err
 }
 
@@ -346,7 +432,8 @@ var optCpuProfile = flag.String("cpuprof", "", "write cpu profile to file")
 var optT1 = flag.Bool("t1", true, "do predifined test 1")
 var optT2 = flag.Bool("t2", true, "do predifined test 2")
 var optSize = flag.Uint64("b", 10000000000, "number of bytes to transfert")
-var optTimeout = flag.Duration("t", 0, "timeout (in golang duration)")
+var optTimeout = flag.Duration("t", 8*time.Second, "client timeout (in golang duration)")
+var optSTimeout = flag.Duration("st", 0, "server timeout (in golang duration)")
 
 func main() {
 
@@ -390,11 +477,15 @@ func main() {
 		return
 	}
 
+	url := fmt.Sprintf("https://localhost:2222/%d", *optSize)
+	if *optSTimeout > 0 {
+		url += "?timeout=" + (*optSTimeout).String()
+	}
 	if *optT1 {
-		doClient(ctx, fmt.Sprintf("https://localhost:2222/%d", *optSize), false, *optTimeout)
+		doClient(ctx, url, false, *optTimeout)
 	}
 	if *optT2 {
-		doClient(ctx, fmt.Sprintf("https://localhost:2222/%d", *optSize), true, *optTimeout)
+		doClient(ctx, url, true, *optTimeout)
 	}
 	cancel()
 	wg.Wait()
