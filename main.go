@@ -38,7 +38,8 @@ import (
 // usage: run with no argument to do a test with 10G of data
 // use the "-s" option to be in server only mode and use another program like curl (or https://nspeed.app) to test
 // locally or over the wire
-// use ther "-t duration" to limit the test duration. for instance '-t 1s' for 1 second.
+// use ther "-t duration" to limit the test duration from the client side.
+// use ther "-st duration" to limit the test duration from the server side.
 // see "-h" also.
 
 // build a 1MiB buffer of random data
@@ -193,25 +194,29 @@ func streamBytes(w http.ResponseWriter, r *http.Request, size int64, timeout tim
 
 	size_tx := int64(0)
 	hasEnded := false
+	var writeErr error
 	var numChunk = size / chunkSize
 	for i := int64(0); i < numChunk; i++ {
 		n, err := w.Write(chunk)
 		size_tx = size_tx + int64(n)
 		if err != nil {
 			hasEnded = true
-			break
+			writeErr = err
 		}
 	}
 	if size%chunkSize > 0 && !hasEnded {
-		n, _ := w.Write(chunk[:size%chunkSize])
+		n, err := w.Write(chunk[:size%chunkSize])
 		size_tx = size_tx + int64(n)
+		if err != nil {
+			writeErr = err
+		}
 	}
 
-	f := w.(http.Flusher)
-	f.Flush()
+	// f := w.(http.Flusher)
+	// f.Flush()
 
 	duration := time.Since(startTime)
-	fmt.Printf("server sent %d bytes in %s = %s (%d chunks) to %s\n", size_tx, duration, FormatBitperSecond(duration.Seconds(), size_tx), chunkSize, r.RemoteAddr)
+	fmt.Printf("server sent %d bytes in %s = %s (%d chunks) to %s (server error : %s)\n", size_tx, duration, FormatBitperSecond(duration.Seconds(), size_tx), chunkSize, r.RemoteAddr, writeErr)
 }
 
 // create a H2/H3 HTTP server, wait for ctx.Done(), shutdown the server and signal the WaitGroup
@@ -294,7 +299,7 @@ func Download(ctx context.Context, url string, h3 bool) error {
 		rt = &http3.RoundTripper{TLSClientConfig: tlsClientConfig}
 	}
 	var body io.ReadCloser = http.NoBody
-
+	tlsClientConfig.ServerName = "localhost"
 	req, err := http.NewRequestWithContext(ctx, "GET", url, body)
 
 	if err != nil {
@@ -304,13 +309,13 @@ func Download(ctx context.Context, url string, h3 bool) error {
 	// client
 	client := &http.Client{Transport: rt}
 	resp, err := client.Do(req)
-	err = fixH2H3Errors(err)
+	//err = fixH2H3Errors("c->s", err)
 
 	if err == nil && resp != nil {
 		fmt.Printf("receiving data with %s\n", resp.Proto)
 		wm := Metrics{}
 		_, err = io.CopyBuffer(&wm, resp.Body, bigbuff[:])
-		err = fixH2H3Errors(err)
+		err = fixH2H3Errors("s->c", err)
 
 		resp.Body.Close()
 
@@ -334,9 +339,11 @@ func Download(ctx context.Context, url string, h3 bool) error {
 
 // try to unify differences between http/1, http/2, http/3 behaviors
 // when a client or server timeout occured
-func fixH2H3Errors(err error) error {
+func fixH2H3Errors(source string, err error) error {
 	if err != nil {
-		fmt.Println("client got error of type", reflect.TypeOf(err))
+		fmt.Printf("%s: client got error of type %s\n", source, reflect.TypeOf(err))
+	} else {
+		fmt.Printf("%s :client got no error\n", source)
 	}
 
 	/*
@@ -379,18 +386,20 @@ func fixH2H3Errors(err error) error {
 		     c->s: "stream error: stream ID 1; INTERNAL_ERROR; received from peer" type: *url.Error
 		     s->c: "stream ID 1; INTERNAL_ERROR; received from peer" type: http2.StreamError
 		   http/3:
-		     WriteTimeout & ReadTimeout/ReadHeaderTimeout not handled
-		     SetWriteDeadline/SetReadDeadline not supported
+		     c->s: WriteTimeout & ReadTimeout/ReadHeaderTimeout not yet tested
+		     s->c: nothing reported client side (bug?), deadline exceeded server side
 
 	*/
 
 	// http/3 client : context.DeadlineExceeded returns a quic.StreamError with ErrorCode == 0x10c
 	var qerr *quic.StreamError
-	if errors.As(err, &qerr) && qerr.ErrorCode == 0x10c {
-		// change error to context timeout
-		return context.DeadlineExceeded
+	if errors.As(err, &qerr) {
+		if qerr.ErrorCode == quic.StreamErrorCode(http3.ErrCodeRequestCanceled) {
+			// change error to context timeout
+			return context.DeadlineExceeded
+		}
+		fmt.Println("quic.ErrorCode = ", reflect.TypeOf(err))
 	}
-
 	// http/2 server timeout return: "stream error: stream ID x; INTERNAL_ERROR; received from peer"
 	if h2err, ok := err.(http2.StreamError); ok {
 		// don't change if not remote
@@ -429,8 +438,8 @@ var optServer = flag.Bool("s", false, "server mode only")
 var optClient = flag.String("c", "", "client only mode, connect to url")
 var optH3 = flag.Bool("h3", false, "use http/3 client (use with -c)")
 var optCpuProfile = flag.String("cpuprof", "", "write cpu profile to file")
-var optT1 = flag.Bool("t1", true, "do predifined test 1")
-var optT2 = flag.Bool("t2", true, "do predifined test 2")
+var optH2 = flag.Bool("noh2", false, "skip HTTP/2 test")
+var optT2 = flag.Bool("noh3", false, "skip HTTP/3 test")
 var optSize = flag.Uint64("b", 10000000000, "number of bytes to transfert")
 var optTimeout = flag.Duration("t", 8*time.Second, "client timeout (in golang duration)")
 var optSTimeout = flag.Duration("st", 0, "server timeout (in golang duration)")
@@ -481,11 +490,13 @@ func main() {
 	if *optSTimeout > 0 {
 		url += "?timeout=" + (*optSTimeout).String()
 	}
-	if *optT1 {
+	if !*optH2 {
 		doClient(ctx, url, false, *optTimeout)
+		fmt.Println()
 	}
-	if *optT2 {
+	if !*optT2 {
 		doClient(ctx, url, true, *optTimeout)
+		fmt.Println()
 	}
 	cancel()
 	wg.Wait()
