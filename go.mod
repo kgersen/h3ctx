@@ -23,4 +23,4 @@ require (
 	golang.org/x/tools v0.9.2 // indirect
 )
 
-//replace github.com/quic-go/quic-go => ../../quic-go
+//replace github.com/quic-go/quic-go => ../quic-go

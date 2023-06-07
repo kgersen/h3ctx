@@ -286,6 +286,9 @@ func createServer(ctx context.Context, host string, port int, wg *sync.WaitGroup
 func Download(ctx context.Context, url string, h3 bool) error {
 
 	tlsClientConfig := clientTlsConfig
+	if *optSkipTLS {
+		clientTlsConfig.InsecureSkipVerify = true
+	}
 	var dialer = &net.Dialer{
 		Timeout:       1 * time.Second, // fail quick
 		FallbackDelay: -1,              // don't use Happy Eyeballs
@@ -299,7 +302,6 @@ func Download(ctx context.Context, url string, h3 bool) error {
 		rt = &http3.RoundTripper{TLSClientConfig: tlsClientConfig}
 	}
 	var body io.ReadCloser = http.NoBody
-	tlsClientConfig.ServerName = "localhost"
 	req, err := http.NewRequestWithContext(ctx, "GET", url, body)
 
 	if err != nil {
@@ -436,6 +438,7 @@ func doClient(ctx context.Context, url string, h3 bool, timeout time.Duration) e
 
 var optServer = flag.Bool("s", false, "server mode only")
 var optClient = flag.String("c", "", "client only mode, connect to url")
+var optSkipTLS = flag.Bool("k", false, "insecure/skip tls verification (client only mode)")
 var optH3 = flag.Bool("h3", false, "use http/3 client (use with -c)")
 var optCpuProfile = flag.String("cpuprof", "", "write cpu profile to file")
 var optH2 = flag.Bool("noh2", false, "skip HTTP/2 test")
@@ -639,7 +642,10 @@ func generateTLSConfig() (serverTLSConf *tls.Config, clientTLSConf *tls.Config, 
 		Certificates: []tls.Certificate{serverCert},
 	}
 
-	certpool := x509.NewCertPool()
+	certpool, err := x509.SystemCertPool() //x509.NewCertPool()
+	if err != nil {
+		return nil, nil, err
+	}
 	certpool.AppendCertsFromPEM(caPEM.Bytes())
 	clientTLSConf = &tls.Config{
 		RootCAs: certpool,
