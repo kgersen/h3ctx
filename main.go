@@ -18,6 +18,7 @@ import (
 	"math/rand"
 	"net"
 	"net/http"
+	"net/http/httptrace"
 	"os"
 	"os/signal"
 	"reflect"
@@ -31,6 +32,7 @@ import (
 
 	"github.com/quic-go/quic-go"
 	"github.com/quic-go/quic-go/http3"
+	"github.com/quic-go/quic-go/logging"
 	"golang.org/x/net/http2"
 )
 
@@ -283,7 +285,9 @@ func createServer(ctx context.Context, host string, port int, wg *sync.WaitGroup
 }
 
 // http client, download the url to 'null' (discard)
-func Download(ctx context.Context, url string, h3 bool) error {
+func Download(ctx context.Context, url string, h3 bool, ipVersion int) error {
+
+	//assert ipVersion = 0 || 4 || 6
 
 	tlsClientConfig := clientTlsConfig
 	if *optSkipTLS {
@@ -294,13 +298,66 @@ func Download(ctx context.Context, url string, h3 bool) error {
 		FallbackDelay: -1,              // don't use Happy Eyeballs
 	}
 	var netTransport = http.DefaultTransport.(*http.Transport).Clone()
-	netTransport.DialContext = dialer.DialContext
+	// custom DialContext that can force IPv4 or IPv6
+	netTransport.DialContext = func(ctx context.Context, network string, address string) (net.Conn, error) {
+		if network == "udp" || network == "tcp" {
+			if ipVersion != 0 {
+				network += strconv.Itoa(ipVersion)
+			}
+		}
+		return dialer.DialContext(ctx, network, address)
+	}
 	netTransport.TLSClientConfig = tlsClientConfig
 
 	var rt http.RoundTripper = netTransport
 	if h3 {
-		rt = &http3.RoundTripper{TLSClientConfig: tlsClientConfig}
+		// with use http3.RoundTripper but it doesnt expose its quic.Transport member field so we must use our own
+		var qTransport *quic.Transport
+		defer func() {
+			if qTransport != nil {
+				fmt.Println("closing local quic transport")
+				qTransport.Close()
+				qTransport = nil
+			}
+		}()
+
+		qt := &quicTracer{}
+		rt = &http3.RoundTripper{
+			TLSClientConfig: tlsClientConfig,
+			QuicConfig: &quic.Config{
+				Tracer: qt.TracerForConnection,
+			},
+			Dial: func(ctx context.Context, addr string, tlsCfg *tls.Config, cfg *quic.Config) (quic.EarlyConnection, error) {
+				// this dialer respect ipv6/ipv4 preference
+				network := "udp"
+				udpAddr, err := netTransport.DialContext(ctx, network, addr)
+				if err != nil {
+					return nil, err
+				}
+				if qTransport == nil {
+					// check for Zone on IPv6 link-local for instance, some OS might need the Zone too
+					udpConn, err := net.ListenUDP(network, nil)
+					if err != nil {
+						return nil, err
+					}
+					qTransport = &quic.Transport{Conn: udpConn}
+				}
+				// use same dialer as other http version
+
+				fmt.Printf("HTTP3 dialing %s -> %s\n", addr, udpAddr.RemoteAddr().String())
+				return qTransport.DialEarly(ctx, udpAddr.RemoteAddr(), tlsCfg, cfg)
+			},
+		}
 	}
+	trace := &httptrace.ClientTrace{
+		GotConn: func(connInfo httptrace.GotConnInfo) {
+			if connInfo.Conn != nil {
+				fmt.Println("client connected to ", connInfo.Conn.RemoteAddr())
+			}
+		},
+	}
+	ctx = httptrace.WithClientTrace(ctx, trace)
+
 	var body io.ReadCloser = http.NoBody
 	req, err := http.NewRequestWithContext(ctx, "GET", url, body)
 
@@ -422,14 +479,14 @@ func fixH2H3Errors(source string, err error) error {
 }
 
 // client just like "curl -o /dev/null url"
-func doClient(ctx context.Context, url string, h3 bool, timeout time.Duration) error {
+func doClient(ctx context.Context, url string, h3 bool, timeout time.Duration, ipVersion int) error {
 	fmt.Printf("downloading %s\n", url)
 	if timeout > 0 {
 		ctx2, cancel := context.WithTimeout(ctx, timeout)
 		defer cancel()
 		ctx = ctx2
 	}
-	err := Download(ctx, url, h3)
+	err := Download(ctx, url, h3, ipVersion)
 	if err != nil {
 		fmt.Printf("client error for %s: %s\n", url, err)
 	}
@@ -447,9 +504,22 @@ var optSize = flag.Uint64("b", 10000000000, "number of bytes to transfert")
 var optTimeout = flag.Duration("t", 8*time.Second, "client timeout (in golang duration)")
 var optSTimeout = flag.Duration("st", 0, "server timeout (in golang duration)")
 
+var optIPv4 = flag.Bool("4", false, "force IPv4")
+var optIPv6 = flag.Bool("6", false, "force IPv6")
+
 func main() {
 
 	flag.Parse()
+	ipVersion := 0
+	if *optIPv4 && *optIPv6 {
+		log.Fatal("cant force both IPv4 and IPv6")
+	}
+	if *optIPv4 {
+		ipVersion = 4
+	}
+	if *optIPv6 {
+		ipVersion = 6
+	}
 
 	if *optCpuProfile != "" {
 		runtime.SetBlockProfileRate(1)
@@ -485,7 +555,7 @@ func main() {
 			return
 		}
 	} else {
-		doClient(ctx, *optClient, *optH3, *optTimeout)
+		doClient(ctx, *optClient, *optH3, *optTimeout, ipVersion)
 		return
 	}
 
@@ -494,11 +564,11 @@ func main() {
 		url += "?timeout=" + (*optSTimeout).String()
 	}
 	if !*optH2 {
-		doClient(ctx, url, false, *optTimeout)
+		doClient(ctx, url, false, *optTimeout, ipVersion)
 		fmt.Println()
 	}
 	if !*optT2 {
-		doClient(ctx, url, true, *optTimeout)
+		doClient(ctx, url, true, *optTimeout, ipVersion)
 		fmt.Println()
 	}
 	cancel()
@@ -652,4 +722,20 @@ func generateTLSConfig() (serverTLSConf *tls.Config, clientTLSConf *tls.Config, 
 	}
 
 	return
+}
+
+type quicTracer struct {
+	logging.NullTracer
+}
+
+func (t *quicTracer) TracerForConnection(context.Context, logging.Perspective, logging.ConnectionID) logging.ConnectionTracer {
+	return &quicConnectionTracer{}
+}
+
+type quicConnectionTracer struct {
+	logging.NullConnectionTracer
+}
+
+func (t *quicConnectionTracer) StartedConnection(local, remote net.Addr, srcConnID, destConnID logging.ConnectionID) {
+	fmt.Printf("QUIC: connected to %s from %s (ids=%s-%s)\n", remote, local, srcConnID, destConnID)
 }
