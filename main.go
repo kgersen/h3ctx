@@ -558,8 +558,12 @@ func main() {
 		doClient(ctx, *optClient, *optH3, *optTimeout, ipVersion)
 		return
 	}
-
-	url := fmt.Sprintf("https://localhost:2222/%d", *optSize)
+	hostname := "localhost"
+	// the Go dns resolver has some issue with localhost & IPv6
+	if ipVersion == 6 {
+		hostname = "[::1]"
+	}
+	url := fmt.Sprintf("https://%s:2222/%d", hostname, *optSize)
 	if *optSTimeout > 0 {
 		url += "?timeout=" + (*optSTimeout).String()
 	}
