@@ -222,7 +222,7 @@ func streamBytes(w http.ResponseWriter, r *http.Request, size int64, timeout tim
 }
 
 // create a H2/H3 HTTP server, wait for ctx.Done(), shutdown the server and signal the WaitGroup
-func createServer(ctx context.Context, host string, port int, wg *sync.WaitGroup, ready chan bool) {
+func createServer(ctx context.Context, host string, port int, ipVersion int, wg *sync.WaitGroup, ready chan bool) {
 	wg.Add(1)
 	defer wg.Done()
 
@@ -247,18 +247,26 @@ func createServer(ctx context.Context, host string, port int, wg *sync.WaitGroup
 		quicServer.Handler.ServeHTTP(w, r)
 	})
 
-	ln, err := net.Listen("tcp", server.Addr)
+	networkTCP := "tcp"
+	if ipVersion != 0 {
+		networkTCP += strconv.Itoa(ipVersion)
+	}
+	ln, err := net.Listen(networkTCP, server.Addr)
 	if err != nil {
-		log.Fatalf("cannot listen (tcp) to %s: %s", server.Addr, err)
+		log.Fatalf("cannot listen (%s) to %s: %s", networkTCP, server.Addr, err)
 	}
 
-	udpAddr, err := net.ResolveUDPAddr("udp", quicServer.Addr)
+	networkUDP := "udp"
+	if ipVersion != 0 {
+		networkUDP += strconv.Itoa(ipVersion)
+	}
+	udpAddr, err := net.ResolveUDPAddr(networkUDP, quicServer.Addr)
 	if err != nil {
 		log.Fatalf("cannot ResolveUDPAddr %s: %s", server.Addr, err)
 	}
-	ln3, err := net.ListenUDP("udp", udpAddr)
+	ln3, err := net.ListenUDP(networkUDP, udpAddr)
 	if err != nil {
-		log.Fatalf("cannot listen (udp) to %s: %s", server.Addr, err)
+		log.Fatalf("cannot listen (%s) to %s: %s", networkUDP, server.Addr, err)
 	}
 	// this will wait for ctx.Done then shutdown the server
 	go func() {
@@ -272,6 +280,7 @@ func createServer(ctx context.Context, host string, port int, wg *sync.WaitGroup
 	// signal the server is listening (so client(s) can start)
 	ready <- true
 
+	fmt.Printf("server listening at %s (tcp) and %s (udp)\n", ln.Addr().String(), ln3.LocalAddr().String())
 	//spawn h3 (yeah this is not a clean way to do this...)
 	go func() {
 		quicServer.Serve(ln3)
@@ -544,9 +553,8 @@ func main() {
 		ready := make(chan bool)
 
 		//create a server
-		go createServer(ctx, "", 2222, &wg, ready)
+		go createServer(ctx, "", 2222, ipVersion, &wg, ready)
 		<-ready
-		fmt.Printf("server created and listening at %s (tcp/h2) and %s (quic/h3)\n", "2222", "2222")
 
 		// if server mode, just wait forever for something else to cancel
 		if *optServer {
