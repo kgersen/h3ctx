@@ -285,7 +285,7 @@ func createServer(ctx context.Context, host string, port int, wg *sync.WaitGroup
 }
 
 // http client, download the url to 'null' (discard)
-func Download(ctx context.Context, url string, h3 bool, ipVersion int) error {
+func Download(ctx context.Context, url string, httpVersion int, ipVersion int) error {
 
 	//assert ipVersion = 0 || 4 || 6
 
@@ -307,10 +307,17 @@ func Download(ctx context.Context, url string, h3 bool, ipVersion int) error {
 		}
 		return dialer.DialContext(ctx, network, address)
 	}
-	netTransport.TLSClientConfig = tlsClientConfig
 
 	var rt http.RoundTripper = netTransport
-	if h3 {
+
+	if httpVersion == 1 {
+		netTransport.ForceAttemptHTTP2 = false
+		netTransport.TLSClientConfig.NextProtos = []string{"http/1.1"}
+	}
+
+	netTransport.TLSClientConfig = tlsClientConfig
+
+	if httpVersion == 3 {
 		// with use http3.RoundTripper but it doesnt expose its quic.Transport member field so we must use our own
 		var qTransport *quic.Transport
 		defer func() {
@@ -479,14 +486,14 @@ func fixH2H3Errors(source string, err error) error {
 }
 
 // client just like "curl -o /dev/null url"
-func doClient(ctx context.Context, url string, h3 bool, timeout time.Duration, ipVersion int) error {
+func doClient(ctx context.Context, url string, httpVersion int, timeout time.Duration, ipVersion int) error {
 	fmt.Printf("downloading %s\n", url)
 	if timeout > 0 {
 		ctx2, cancel := context.WithTimeout(ctx, timeout)
 		defer cancel()
 		ctx = ctx2
 	}
-	err := Download(ctx, url, h3, ipVersion)
+	err := Download(ctx, url, httpVersion, ipVersion)
 	if err != nil {
 		fmt.Printf("client error for %s: %s\n", url, err)
 	}
@@ -498,8 +505,9 @@ var optClient = flag.String("c", "", "client only mode, connect to url")
 var optSkipTLS = flag.Bool("k", false, "insecure/skip tls verification (client only mode)")
 var optH3 = flag.Bool("h3", false, "use http/3 client (use with -c)")
 var optCpuProfile = flag.String("cpuprof", "", "write cpu profile to file")
-var optH2 = flag.Bool("noh2", false, "skip HTTP/2 test")
-var optT2 = flag.Bool("noh3", false, "skip HTTP/3 test")
+var optNoH1 = flag.Bool("noh1", false, "skip HTTP/1.1 test")
+var optNoH2 = flag.Bool("noh2", false, "skip HTTP/2 test")
+var optNoH3 = flag.Bool("noh3", false, "skip HTTP/3 test")
 var optSize = flag.Uint64("b", 10000000000, "number of bytes to transfert")
 var optTimeout = flag.Duration("t", 8*time.Second, "client timeout (in golang duration)")
 var optSTimeout = flag.Duration("st", 0, "server timeout (in golang duration)")
@@ -555,7 +563,11 @@ func main() {
 			return
 		}
 	} else {
-		doClient(ctx, *optClient, *optH3, *optTimeout, ipVersion)
+		httpVersion := 2
+		if *optH3 {
+			httpVersion = 3
+		}
+		doClient(ctx, *optClient, httpVersion, *optTimeout, ipVersion)
 		return
 	}
 
@@ -563,12 +575,16 @@ func main() {
 	if *optSTimeout > 0 {
 		url += "?timeout=" + (*optSTimeout).String()
 	}
-	if !*optH2 {
-		doClient(ctx, url, false, *optTimeout, ipVersion)
+	if !*optNoH1 {
+		doClient(ctx, url, 1, *optTimeout, ipVersion)
 		fmt.Println()
 	}
-	if !*optT2 {
-		doClient(ctx, url, true, *optTimeout, ipVersion)
+	if !*optNoH2 {
+		doClient(ctx, url, 2, *optTimeout, ipVersion)
+		fmt.Println()
+	}
+	if !*optNoH3 {
+		doClient(ctx, url, 3, *optTimeout, ipVersion)
 		fmt.Println()
 	}
 	cancel()
