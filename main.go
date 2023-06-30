@@ -36,13 +36,14 @@ import (
 	"golang.org/x/net/http2"
 )
 
-// this program compares transfert speed of the Golang http server (and client) between HTTP/2 and HTTP/3 versions
+// this program compares transfert speed of the Golang http server (and client) between HTTP/1.1, HTTP/2 and HTTP/3 versions
+// it also allow to test client context deadline and server timeouts.
 // usage: run with no argument to do a test with 10G of data
 // use the "-s" option to be in server only mode and use another program like curl (or https://nspeed.app) to test
-// locally or over the wire
-// use ther "-t duration" to limit the test duration from the client side.
-// use ther "-st duration" to limit the test duration from the server side.
-// see "-h" also.
+// locally or over the wire. you can also use the same program as a remote client with the "-c url" option
+// use the "-t duration" to limit the test duration from the client side (which is on at 8 seconds by default)
+// use the "-st duration" to limit the test duration from the server side.
+// see "-h" also for more help.
 
 // build a 1MiB buffer of random data
 const MaxChunkSize = 1024 * 1024 // warning : 1 MiB // this will be allocated in memory
@@ -182,7 +183,6 @@ func streamBytes(w http.ResponseWriter, r *http.Request, size int64, timeout tim
 
 	w.Header().Set("Content-Type", "application/octet-stream")
 	w.Header().Set("Content-Length", strconv.FormatInt(size, 10))
-	//fmt.Printf("header sent to %s: %s\n", r.RemoteAddr, r.URL)
 
 	if timeout > 0 {
 		rc := http.NewResponseController(w)
@@ -218,7 +218,7 @@ func streamBytes(w http.ResponseWriter, r *http.Request, size int64, timeout tim
 	// f.Flush()
 
 	duration := time.Since(startTime)
-	fmt.Printf("server sent %d bytes in %s = %s (%d chunks) to %s (server error : %s)\n", size_tx, duration, FormatBitperSecond(duration.Seconds(), size_tx), chunkSize, r.RemoteAddr, writeErr)
+	fmt.Printf("[SERVER] sent %d bytes in %s = %s (%d chunks) to %s (server error : %s)\n", size_tx, duration, FormatBitperSecond(duration.Seconds(), size_tx), chunkSize, r.RemoteAddr, writeErr)
 }
 
 // create a H2/H3 HTTP server, wait for ctx.Done(), shutdown the server and signal the WaitGroup
@@ -524,10 +524,16 @@ var optSTimeout = flag.Duration("st", 0, "server timeout (in golang duration)")
 var optIPv4 = flag.Bool("4", false, "force IPv4")
 var optIPv6 = flag.Bool("6", false, "force IPv6")
 
+var optNoGSO = flag.Bool("nogso", false, "disable GSO")
+
 func main() {
 
 	flag.Parse()
 	ipVersion := 0
+
+	if *optNoGSO {
+		os.Setenv("QUIC_GO_DISABLE_GSO", "true")
+	}
 	if *optIPv4 && *optIPv6 {
 		log.Fatal("cant force both IPv4 and IPv6")
 	}
