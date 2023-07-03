@@ -524,15 +524,15 @@ var optSTimeout = flag.Duration("st", 0, "server timeout (in golang duration)")
 var optIPv4 = flag.Bool("4", false, "force IPv4")
 var optIPv6 = flag.Bool("6", false, "force IPv6")
 
-var optNoGSO = flag.Bool("nogso", false, "disable GSO")
+var optGSO = flag.Bool("gso", false, "enable GSO")
 
 func main() {
 
 	flag.Parse()
 	ipVersion := 0
 
-	if *optNoGSO {
-		os.Setenv("QUIC_GO_DISABLE_GSO", "true")
+	if *optGSO {
+		os.Setenv("QUIC_GO_ENABLE_GSO", "true")
 	}
 	if *optIPv4 && *optIPv6 {
 		log.Fatal("cant force both IPv4 and IPv6")
