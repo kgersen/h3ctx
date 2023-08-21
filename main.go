@@ -524,15 +524,17 @@ var optSTimeout = flag.Duration("st", 0, "server timeout (in golang duration)")
 var optIPv4 = flag.Bool("4", false, "force IPv4")
 var optIPv6 = flag.Bool("6", false, "force IPv6")
 
-var optGSO = flag.Bool("gso", false, "enable GSO")
+var optNoGSO = flag.Bool("nogso", false, "disable GSO (broken with quic-go v0.38.0)")
 
 func main() {
 
 	flag.Parse()
 	ipVersion := 0
 
-	if *optGSO {
-		os.Setenv("QUIC_GO_ENABLE_GSO", "true")
+	// doesn't work anymore. quic-go check for env var in an init() function so too late to set it here
+	if *optNoGSO {
+		fmt.Println("disabling GSO")
+		os.Setenv("QUIC_GO_DISABLE_GSO", "true")
 	}
 	if *optIPv4 && *optIPv6 {
 		log.Fatal("cant force both IPv4 and IPv6")
