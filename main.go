@@ -236,11 +236,11 @@ func createServer(ctx context.Context, host string, port int, ipVersion int, wg 
 	quicServer := &http3.Server{
 		Addr:       listenAddr,
 		TLSConfig:  serverTlsConfig,
-		QuicConfig: quicConf,
+		QUICConfig: quicConf,
 		Handler:    server.Handler,
 	}
 	server.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		err := quicServer.SetQuicHeaders(w.Header())
+		err := quicServer.SetQUICHeaders(w.Header())
 		if err != nil {
 			log.Fatal(err)
 		}
@@ -337,11 +337,10 @@ func Download(ctx context.Context, url string, httpVersion int, ipVersion int) e
 			}
 		}()
 
-		qt := &quicTracer{}
-		rt = &http3.RoundTripper{
+		rt = &http3.Transport{
 			TLSClientConfig: tlsClientConfig,
-			QuicConfig: &quic.Config{
-				Tracer: qt.TracerForConnection,
+			QUICConfig: &quic.Config{
+				Tracer: tracer,
 			},
 			Dial: func(ctx context.Context, addr string, tlsCfg *tls.Config, cfg *quic.Config) (quic.EarlyConnection, error) {
 				// this dialer respect ipv6/ipv4 preference
@@ -760,18 +759,10 @@ func generateTLSConfig() (serverTLSConf *tls.Config, clientTLSConf *tls.Config, 
 	return
 }
 
-type quicTracer struct {
-	logging.NullTracer
-}
-
-func (t *quicTracer) TracerForConnection(context.Context, logging.Perspective, logging.ConnectionID) logging.ConnectionTracer {
-	return &quicConnectionTracer{}
-}
-
-type quicConnectionTracer struct {
-	logging.NullConnectionTracer
-}
-
-func (t *quicConnectionTracer) StartedConnection(local, remote net.Addr, srcConnID, destConnID logging.ConnectionID) {
-	fmt.Printf("QUIC: connected to %s from %s (ids=%s-%s)\n", remote, local, srcConnID, destConnID)
+func tracer(ctx context.Context, p logging.Perspective, ci quic.ConnectionID) *logging.ConnectionTracer {
+	return &logging.ConnectionTracer{
+		StartedConnection: func(local, remote net.Addr, srcConnID, destConnID logging.ConnectionID) {
+			fmt.Println("  connected to", remote)
+		},
+	}
 }
